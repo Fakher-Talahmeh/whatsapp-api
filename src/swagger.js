@@ -9,7 +9,7 @@ const options = {
       description:
         "API for sending/receiving WhatsApp messages via whatsapp-web.js",
     },
-    servers: [{ url: "http://localhost:3000" }],
+    // servers: [{ url: "http://localhost:3000" }],
     components: {
       securitySchemes: {
         ApiKeyAuth: {
