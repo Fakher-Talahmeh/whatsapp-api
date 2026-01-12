@@ -1,0 +1,9 @@
+node_modules
+.git
+.env
+.wwebjs_auth
+.wwebjs_cache
+sessions.json
+npm-debug.log
+Dockerfile
+docker-compose.yml
