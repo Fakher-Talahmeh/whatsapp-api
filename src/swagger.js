@@ -48,6 +48,39 @@ const options = {
             },
           },
         },
+        UnreadMessageItem: {
+          type: "object",
+          properties: {
+            id: { type: "string", example: "false_9705..._ABCDEF" },
+            from: { type: "string", example: "9705XXXXXXX@c.us" },
+            body: { type: "string", example: "Hello" },
+            timestamp: { type: "number", example: 1700000000 },
+            chatId: { type: "string", example: "9705XXXXXXX@c.us" },
+          },
+        },
+        UnreadSessionMessages: {
+          type: "object",
+          properties: {
+            sessionId: { type: "string", example: "session-1" },
+            status: {
+              type: "string",
+              enum: ["initializing", "qr", "ready", "disconnected", "error"],
+            },
+            messages: {
+              type: "array",
+              items: { $ref: "#/components/schemas/UnreadMessageItem" },
+            },
+          },
+        },
+        UnreadMessagesResponse: {
+          type: "object",
+          properties: {
+            sessions: {
+              type: "array",
+              items: { $ref: "#/components/schemas/UnreadSessionMessages" },
+            },
+          },
+        },
         SessionQrResponse: {
           type: "object",
           properties: {

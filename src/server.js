@@ -176,6 +176,141 @@ app.get("/sessions", requireApiKey, (req, res) => {
 
 /**
  * @openapi
+ * /unread-messages:
+ *   get:
+ *     summary: Get unread messages across all sessions and chats
+ *     security:
+ *       - ApiKeyAuth: []
+ *     responses:
+ *       200:
+ *         description: Unread messages
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: "#/components/schemas/UnreadMessagesResponse"
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+app.get("/unread-messages", requireApiKey, async (req, res) => {
+  try {
+    const sessions = sessionManager.listSessions();
+    const results = [];
+
+    for (const s of sessions) {
+      const session = sessionManager.getSession(s.sessionId);
+      if (!session || s.status !== "ready") {
+        results.push({
+          sessionId: s.sessionId,
+          status: s.status,
+          messages: [],
+        });
+        continue;
+      }
+
+      const chats = await session.client.getChats();
+      const unreadMessages = [];
+
+      for (const chat of chats) {
+        if (!chat.unreadCount || chat.unreadCount <= 0) continue;
+
+        const msgs = await chat.fetchMessages({ limit: chat.unreadCount });
+        for (const msg of msgs) {
+          unreadMessages.push({
+            id: msg.id?._serialized || null,
+            from: msg.from,
+            body: msg.body,
+            timestamp: msg.timestamp,
+            chatId: msg.from || chat.id?._serialized || null,
+          });
+        }
+      }
+
+      results.push({
+        sessionId: s.sessionId,
+        status: s.status,
+        messages: unreadMessages,
+      });
+    }
+
+    res.json({ sessions: results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * @openapi
+ * /sessions/{sessionId}/unread-messages:
+ *   get:
+ *     summary: Get unread messages for a specific session
+ *     security:
+ *       - ApiKeyAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Unread messages
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: "#/components/schemas/UnreadSessionMessages"
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Session not found
+ *       503:
+ *         description: Session not ready
+ *       500:
+ *         description: Server error
+ */
+app.get("/sessions/:sessionId/unread-messages", requireApiKey, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const session = sessionManager.getSession(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    if (session.status !== "ready") {
+      return res.status(503).json({ error: "Session not ready" });
+    }
+
+    const chats = await session.client.getChats();
+    const unreadMessages = [];
+
+    for (const chat of chats) {
+      if (!chat.unreadCount || chat.unreadCount <= 0) continue;
+
+      const msgs = await chat.fetchMessages({ limit: chat.unreadCount });
+      for (const msg of msgs) {
+        unreadMessages.push({
+          id: msg.id?._serialized || null,
+          from: msg.from,
+          body: msg.body,
+          timestamp: msg.timestamp,
+          chatId: msg.from || chat.id?._serialized || null,
+        });
+      }
+    }
+
+    res.json({
+      sessionId,
+      status: session.status,
+      messages: unreadMessages,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * @openapi
  * /sessions/{sessionId}/qr:
  *   get:
  *     summary: Get latest QR for a session
