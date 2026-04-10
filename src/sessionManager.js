@@ -4,6 +4,7 @@ const { Client, LocalAuth } = require("whatsapp-web.js");
 
 const sessions = new Map();
 const SESSIONS_FILE = path.join(process.cwd(), "sessions.json");
+const AUTH_BASE_DIR = path.join(process.cwd(), ".wwebjs_auth");
 
 function nowIso() {
   return new Date().toISOString();
@@ -11,6 +12,44 @@ function nowIso() {
 
 function touch(state) {
   state.lastSeen = nowIso();
+}
+
+function firstNonEmptyString(values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function normalizeMessageBody(message) {
+  return firstNonEmptyString([
+    message?.body,
+    message?.caption,
+    message?._data?.body,
+    message?._data?.caption,
+    message?._data?.selectedButtonId,
+    message?._data?.selectedRowId,
+  ]);
+}
+
+function isSystemOrUnsupportedMessage(message) {
+  const systemTypes = new Set([
+    "e2e_notification",
+    "notification",
+    "protocol",
+    "ciphertext",
+    "revoked",
+    "unknown",
+  ]);
+
+  const type = String(message?.type || "").toLowerCase();
+  if (systemTypes.has(type)) return true;
+  if (!message) return true;
+  if (message.fromMe) return true;
+  if (String(message.from || "").includes("@status")) return true;
+  return false;
 }
 
 function bindClientEvents(sessionId, state, { onWebhook } = {}) {
@@ -40,6 +79,9 @@ function bindClientEvents(sessionId, state, { onWebhook } = {}) {
   client.on("message", async (message) => {
     touch(state);
     if (!onWebhook) return;
+    if (isSystemOrUnsupportedMessage(message)) return;
+
+    const body = normalizeMessageBody(message);
 
     const basePayload = {
       event: "message",
@@ -50,7 +92,7 @@ function bindClientEvents(sessionId, state, { onWebhook } = {}) {
       author: message.author,
       timestamp: message.timestamp,
       type: message.type,
-      body: message.body,
+      body,
       hasMedia: message.hasMedia,
     };
 
@@ -99,13 +141,34 @@ function saveSessionIds() {
   } catch (_) {}
 }
 
-function createSession(sessionId, { onWebhook } = {}) {
-  if (!sessionId) throw new Error("sessionId is required");
+function clearStaleChromiumLocks(sessionId) {
+  const sessionDir = path.join(AUTH_BASE_DIR, `session-${sessionId}`);
+  const lockFiles = [
+    "SingletonLock",
+    "SingletonCookie",
+    "SingletonSocket",
+    "DevToolsActivePort",
+  ];
 
-  const existing = sessions.get(sessionId);
-  if (existing) return existing;
+  for (const file of lockFiles) {
+    const filePath = path.join(sessionDir, file);
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.rmSync(filePath, { force: true });
+      }
+    } catch (_) {}
+  }
+}
 
-  const client = new Client({
+function clearSessionProfile(sessionId) {
+  const sessionDir = path.join(AUTH_BASE_DIR, `session-${sessionId}`);
+  try {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  } catch (_) {}
+}
+
+function buildClient(sessionId) {
+  return new Client({
     authStrategy: new LocalAuth({ clientId: sessionId }),
     puppeteer: {
       headless: true,
@@ -117,6 +180,56 @@ function createSession(sessionId, { onWebhook } = {}) {
       ],
     },
   });
+}
+
+function isProfileLockError(err) {
+  const message = String(err?.message || err || "").toLowerCase();
+  return (
+    message.includes("profile appears to be in use") ||
+    message.includes("process_singleton_posix")
+  );
+}
+
+function initializeClient(sessionId, state, { onWebhook } = {}) {
+  state.client.initialize().catch(async (err) => {
+    if (!state.retriedAfterLock && isProfileLockError(err)) {
+      state.retriedAfterLock = true;
+      console.warn(
+        `Session ${sessionId} locked profile detected. Resetting profile and retrying once.`,
+      );
+
+      try {
+        await state.client.destroy();
+      } catch (_) {}
+
+      clearSessionProfile(sessionId);
+      clearStaleChromiumLocks(sessionId);
+
+      const retryClient = buildClient(sessionId);
+      state.client = retryClient;
+      state.status = "initializing";
+      state.lastQr = null;
+      touch(state);
+      bindClientEvents(sessionId, state, { onWebhook });
+
+      return initializeClient(sessionId, state, { onWebhook });
+    }
+
+    state.status = "error";
+    touch(state);
+    console.error(`Session ${sessionId} initialize error:`, err.message);
+  });
+}
+
+function createSession(sessionId, { onWebhook } = {}) {
+  if (!sessionId) throw new Error("sessionId is required");
+
+  const existing = sessions.get(sessionId);
+  if (existing) return existing;
+
+  clearStaleChromiumLocks(sessionId);
+
+  const client = buildClient(sessionId);
 
   const state = {
     client,
@@ -129,7 +242,7 @@ function createSession(sessionId, { onWebhook } = {}) {
   bindClientEvents(sessionId, state, { onWebhook });
   sessions.set(sessionId, state);
   saveSessionIds();
-  client.initialize();
+  initializeClient(sessionId, state, { onWebhook });
 
   return state;
 }

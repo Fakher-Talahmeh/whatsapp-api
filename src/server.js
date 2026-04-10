@@ -5,14 +5,30 @@ const swaggerSpec = require("./swagger");
 const express = require("express");
 const axios = require("axios");
 const qrcode = require("qrcode");
+const cors = require("cors");
 
 const { MessageMedia } = require("whatsapp-web.js");
 const sessionManager = require("./sessionManager");
 
 const app = express();
+app.use(cors());
 app.use(express.json({ limit: "25mb" })); // لتلقي base64/صور كبيرة
 app.use(express.urlencoded({ extended: true }));
 app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+/**
+ * @openapi
+ * /openapi.json:
+ *   get:
+ *     summary: Get OpenAPI specification JSON
+ *     security: []
+ *     responses:
+ *       200:
+ *         description: OpenAPI document
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: "#/components/schemas/OpenApiSpecResponse"
+ */
 app.get("/openapi.json", (req, res) => res.json(swaggerSpec));
 
 const PORT = process.env.PORT || 3000;
@@ -59,6 +75,103 @@ function getClientForSession(sessionId) {
   }
 
   return { client: session.client };
+}
+
+function firstNonEmptyString(values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function normalizeMessageBody(message) {
+  return firstNonEmptyString([
+    message?.body,
+    message?.caption,
+    message?._data?.body,
+    message?._data?.caption,
+    message?._data?.selectedButtonId,
+    message?._data?.selectedRowId,
+  ]);
+}
+
+function isSystemOrUnsupportedMessage(message) {
+  const systemTypes = new Set([
+    "e2e_notification",
+    "notification",
+    "protocol",
+    "ciphertext",
+    "revoked",
+    "unknown",
+  ]);
+
+  const type = String(message?.type || "").toLowerCase();
+  if (systemTypes.has(type)) return true;
+  if (!message) return true;
+  if (message.fromMe) return true;
+  if (String(message.from || "").includes("@status")) return true;
+  return false;
+}
+
+async function collectUnreadMessages(client) {
+  const chats = await client.getChats();
+  const unreadMessages = [];
+
+  for (const chat of chats) {
+    if (!chat.unreadCount || chat.unreadCount <= 0) continue;
+
+    const msgs = await chat.fetchMessages({ limit: chat.unreadCount });
+    for (const msg of msgs) {
+      if (isSystemOrUnsupportedMessage(msg)) continue;
+
+      unreadMessages.push({
+        id: msg.id?._serialized || null,
+        from: msg.from,
+        body: normalizeMessageBody(msg),
+        timestamp: msg.timestamp,
+        chatId: msg.from || chat.id?._serialized || null,
+      });
+    }
+  }
+
+  return unreadMessages;
+}
+
+async function createImageMedia(image) {
+  if (!image || typeof image !== "object") {
+    throw new Error("Each image must be an object");
+  }
+
+  if (image.imageUrl) {
+    return MessageMedia.fromUrl(image.imageUrl, { unsafeMime: true });
+  }
+
+  if (image.mimetype && image.base64) {
+    return new MessageMedia(
+      image.mimetype,
+      image.base64,
+      image.filename || "image",
+    );
+  }
+
+  throw new Error(
+    "Each image must include either imageUrl or mimetype with base64",
+  );
+}
+
+async function ensurePairingCodeHandler(client) {
+  if (!client?.pupPage) {
+    throw new Error("Session browser is not ready yet");
+  }
+
+  await client.pupPage.evaluate(() => {
+    if (typeof window.onCodeReceivedEvent !== "function") {
+      // whatsapp-web.js expects this callback when requesting pairing code.
+      window.onCodeReceivedEvent = (code) => code;
+    }
+  });
 }
 
 function checkQrRateLimit(req, res, next) {
@@ -209,23 +322,7 @@ app.get("/unread-messages", requireApiKey, async (req, res) => {
         continue;
       }
 
-      const chats = await session.client.getChats();
-      const unreadMessages = [];
-
-      for (const chat of chats) {
-        if (!chat.unreadCount || chat.unreadCount <= 0) continue;
-
-        const msgs = await chat.fetchMessages({ limit: chat.unreadCount });
-        for (const msg of msgs) {
-          unreadMessages.push({
-            id: msg.id?._serialized || null,
-            from: msg.from,
-            body: msg.body,
-            timestamp: msg.timestamp,
-            chatId: msg.from || chat.id?._serialized || null,
-          });
-        }
-      }
+      const unreadMessages = await collectUnreadMessages(session.client);
 
       results.push({
         sessionId: s.sessionId,
@@ -269,45 +366,33 @@ app.get("/unread-messages", requireApiKey, async (req, res) => {
  *       500:
  *         description: Server error
  */
-app.get("/sessions/:sessionId/unread-messages", requireApiKey, async (req, res) => {
-  try {
-    const { sessionId } = req.params;
-    const session = sessionManager.getSession(sessionId);
-    if (!session) {
-      return res.status(404).json({ error: "Session not found" });
-    }
-
-    if (session.status !== "ready") {
-      return res.status(503).json({ error: "Session not ready" });
-    }
-
-    const chats = await session.client.getChats();
-    const unreadMessages = [];
-
-    for (const chat of chats) {
-      if (!chat.unreadCount || chat.unreadCount <= 0) continue;
-
-      const msgs = await chat.fetchMessages({ limit: chat.unreadCount });
-      for (const msg of msgs) {
-        unreadMessages.push({
-          id: msg.id?._serialized || null,
-          from: msg.from,
-          body: msg.body,
-          timestamp: msg.timestamp,
-          chatId: msg.from || chat.id?._serialized || null,
-        });
+app.get(
+  "/sessions/:sessionId/unread-messages",
+  requireApiKey,
+  async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      const session = sessionManager.getSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
       }
-    }
 
-    res.json({
-      sessionId,
-      status: session.status,
-      messages: unreadMessages,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+      if (session.status !== "ready") {
+        return res.status(503).json({ error: "Session not ready" });
+      }
+
+      const unreadMessages = await collectUnreadMessages(session.client);
+
+      res.json({
+        sessionId,
+        status: session.status,
+        messages: unreadMessages,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 /**
  * @openapi
@@ -365,7 +450,7 @@ app.get(
       qr: session.lastQr,
       qrBase64,
     });
-  }
+  },
 );
 
 /**
@@ -436,13 +521,90 @@ app.delete("/sessions/:sessionId", requireApiKey, async (req, res) => {
  *         description: Server error
  */
 
+/**
+ * @openapi
+ * /sessions/{sessionId}/pairing-code:
+ *   post:
+ *     summary: Generate WhatsApp pairing code by phone number (without QR scan)
+ *     security:
+ *       - ApiKeyAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: "#/components/schemas/PairingCodeRequest"
+ *     responses:
+ *       200:
+ *         description: Pairing code generated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: "#/components/schemas/PairingCodeResponse"
+ *       400:
+ *         description: Invalid request
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Session not found
+ *       500:
+ *         description: Server error
+ */
+app.post(
+  "/sessions/:sessionId/pairing-code",
+  requireApiKey,
+  async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      const { phoneNumber, showNotification = true, intervalMs = 180000 } =
+        req.body;
+
+      if (!phoneNumber) {
+        return res.status(400).json({ error: "phoneNumber required" });
+      }
+
+      if (!/^\d{6,20}$/.test(phoneNumber)) {
+        return res.status(400).json({
+          error: "phoneNumber must be digits only in international format",
+        });
+      }
+
+      const session = sessionManager.getSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      await ensurePairingCodeHandler(session.client);
+
+      const pairingCode = await session.client.requestPairingCode(
+        phoneNumber,
+        Boolean(showNotification),
+        Number(intervalMs),
+      );
+
+      res.json({
+        ok: true,
+        sessionId,
+        status: session.status,
+        pairingCode,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
 app.post("/send-text", requireApiKey, async (req, res) => {
   try {
     const { sessionId, to, text } = req.body;
     if (!sessionId || !to || !text) {
-      return res
-        .status(400)
-        .json({ error: "sessionId, to and text required" });
+      return res.status(400).json({ error: "sessionId, to and text required" });
     }
 
     const { client, error } = getClientForSession(sessionId);
@@ -559,6 +721,125 @@ app.post("/send-image-base64", requireApiKey, async (req, res) => {
 /** (اختياري) استخراج base64 لفويس/ميديا عبر Message ID */
 /**
  * @openapi
+ * /send-images-batch:
+ *   post:
+ *     summary: Send multiple WhatsApp images in a single API request
+ *     security:
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: "#/components/schemas/SendImagesBatchRequest"
+ *     responses:
+ *       200:
+ *         description: Sent
+ *       401:
+ *         description: Unauthorized
+ *       400:
+ *         description: Invalid request
+ *       503:
+ *         description: Session not ready
+ *       404:
+ *         description: Session not found
+ *       500:
+ *         description: Server error
+ */
+app.post("/send-images-batch", requireApiKey, async (req, res) => {
+  try {
+    const { sessionId, to, caption, images } = req.body;
+    if (!sessionId || !to || !Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({
+        error: "sessionId, to and a non-empty images array are required",
+      });
+    }
+
+    const { client, error } = getClientForSession(sessionId);
+    if (error) return res.status(error.status).json({ error: error.message });
+
+    const messages = [];
+
+    for (let index = 0; index < images.length; index += 1) {
+      const image = images[index];
+      const media = await createImageMedia(image);
+      const msg = await client.sendMessage(to, media, {
+        caption:
+          image.caption !== undefined
+            ? String(image.caption)
+            : index === 0
+              ? caption || ""
+              : "",
+      });
+
+      messages.push({
+        index,
+        messageId: msg.id?._serialized || null,
+      });
+    }
+
+    res.json({
+      ok: true,
+      sent: messages.length,
+      messages,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * @openapi
+ * /send-file-base64:
+ *   post:
+ *     summary: Send a file/document to WhatsApp using base64 data
+ *     security:
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: "#/components/schemas/SendFileBase64Request"
+ *     responses:
+ *       200:
+ *         description: Sent
+ *       401:
+ *         description: Unauthorized
+ *       400:
+ *         description: Invalid request
+ *       503:
+ *         description: Session not ready
+ *       404:
+ *         description: Session not found
+ *       500:
+ *         description: Server error
+ */
+app.post("/send-file-base64", requireApiKey, async (req, res) => {
+  try {
+    const { sessionId, to, mimetype, base64, filename, caption } = req.body;
+    if (!sessionId || !to || !mimetype || !base64 || !filename) {
+      return res.status(400).json({
+        error: "sessionId, to, mimetype, base64 and filename required",
+      });
+    }
+
+    const { client, error } = getClientForSession(sessionId);
+    if (error) return res.status(error.status).json({ error: error.message });
+
+    const media = new MessageMedia(mimetype, base64, filename);
+    const msg = await client.sendMessage(to, media, {
+      caption: caption || "",
+      sendMediaAsDocument: true,
+    });
+
+    res.json({ ok: true, messageId: msg.id?._serialized });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+/**
+ * @openapi
  * /fetch-media:
  *   post:
  *     summary: Fetch media (base64) from a recent message by chatId + messageId
@@ -623,3 +904,6 @@ app.post("/fetch-media", requireApiKey, async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
+
+
+

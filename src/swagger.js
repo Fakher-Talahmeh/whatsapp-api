@@ -96,6 +96,11 @@ const options = {
             },
           },
         },
+        OpenApiSpecResponse: {
+          type: "object",
+          description: "OpenAPI specification JSON document",
+          additionalProperties: true,
+        },
         SendTextRequest: {
           type: "object",
           required: ["sessionId", "to", "text"],
@@ -130,6 +135,76 @@ const options = {
             caption: { type: "string", example: "Photo" },
           },
         },
+        SendImagesBatchItem: {
+          type: "object",
+          properties: {
+            imageUrl: {
+              type: "string",
+              example: "https://example.com/image-1.jpg",
+            },
+            mimetype: { type: "string", example: "image/jpeg" },
+            base64: { type: "string", description: "Base64 data without prefix" },
+            filename: { type: "string", example: "photo-1.jpg" },
+            caption: { type: "string", example: "First photo" },
+          },
+          description:
+            "Each item must include either imageUrl or mimetype with base64",
+        },
+        SendImagesBatchRequest: {
+          type: "object",
+          required: ["sessionId", "to", "images"],
+          properties: {
+            sessionId: { type: "string", example: "session-1" },
+            to: { type: "string", example: "9705XXXXXXX@c.us" },
+            caption: {
+              type: "string",
+              example: "Album caption sent with the first image if item caption is missing",
+            },
+            images: {
+              type: "array",
+              minItems: 1,
+              items: { $ref: "#/components/schemas/SendImagesBatchItem" },
+            },
+          },
+        },
+        SendFileBase64Request: {
+          type: "object",
+          required: ["sessionId", "to", "mimetype", "base64", "filename"],
+          properties: {
+            sessionId: { type: "string", example: "session-1" },
+            to: { type: "string", example: "9705XXXXXXX@c.us" },
+            mimetype: { type: "string", example: "application/pdf" },
+            base64: { type: "string", description: "Base64 data without prefix" },
+            filename: { type: "string", example: "invoice.pdf" },
+            caption: { type: "string", example: "Invoice February" },
+          },
+        },
+        PairingCodeRequest: {
+          type: "object",
+          required: ["phoneNumber"],
+          properties: {
+            phoneNumber: {
+              type: "string",
+              example: "9705XXXXXXX",
+              description:
+                "Phone number in international format without '+' or spaces",
+            },
+            showNotification: { type: "boolean", example: true },
+            intervalMs: { type: "number", example: 180000 },
+          },
+        },
+        PairingCodeResponse: {
+          type: "object",
+          properties: {
+            ok: { type: "boolean", example: true },
+            sessionId: { type: "string", example: "session-1" },
+            status: {
+              type: "string",
+              enum: ["initializing", "qr", "ready", "disconnected", "error"],
+            },
+            pairingCode: { type: "string", example: "ABCDEFGH" },
+          },
+        },
         FetchMediaRequest: {
           type: "object",
           required: ["sessionId", "chatId", "messageId"],
@@ -145,6 +220,12 @@ const options = {
             ok: { type: "boolean", example: true },
             sessions: { type: "number", example: 2 },
             readyCount: { type: "number", example: 1 },
+          },
+        },
+        SessionRefreshResponse: {
+          type: "object",
+          properties: {
+            ok: { type: "boolean", example: true },
           },
         },
       },
